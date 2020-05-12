@@ -1304,6 +1304,8 @@ var GeoQuery = function (firebaseRef, queryCriteria) {
   return GeoFire;
 })();
 
+export { GeoFire };
+
 // Export GeoFire if this is being run in node
 if (typeof module !== "undefined" && typeof process !== "undefined") {
   module.exports = GeoFire;
