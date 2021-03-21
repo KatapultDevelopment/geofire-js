@@ -49,7 +49,7 @@ var GeoCallbackRegistration = function(cancelCallback) {
  *
  * @constructor
  * @this {GeoFire}
- * @param {Firebase} firebaseRef A Firebase reference where the GeoFire data will be stored.
+ * @param {Firebase or Firestore} firebaseRef A Firebase or Firestore reference where the GeoFire data will be stored.
  */
 var GeoFire = function(firebaseRef) {
   /********************/
@@ -76,16 +76,30 @@ var GeoFire = function(firebaseRef) {
     return Promise.all(geohashesToQuery.map(toQueryStr => {
       // decode the geohash query string
       var query = toQueryStr.split(':');
-
-      return _firebaseRef.orderByChild("g").startAt(query[0]).endAt(query[1]).once("value").then(s => {
-        var result = s.val();
-        for (var key in result) {
-          var distanceFromCenter = GeoFire.distance(result[key].l, queryCriteria.center);
-          if (distanceFromCenter <= queryCriteria.radius) {
-            data[key] = result[key];
+      
+      // Check if the reference is realtime database or firestore
+      if(_firebaseRef.firestore) {
+        return _firebaseRef.orderBy("g").startAt(query[0]).endAt(query[1]).get().then(querySnapshot => {
+          for (let i = 0; i < querySnapshot.docs.length; i++) {
+            let key = querySnapshot.docs[i].id;
+            let result = querySnapshot.docs[i].data();
+            var distanceFromCenter = GeoFire.distance(result.l, queryCriteria.center);
+            if (distanceFromCenter <= queryCriteria.radius) {
+              data[key] = result;
+            }
           }
-        }
-      });
+        });
+      } else {
+        return _firebaseRef.orderByChild("g").startAt(query[0]).endAt(query[1]).once("value").then(s => {
+          var result = s.val();
+          for (var key in result) {
+            var distanceFromCenter = GeoFire.distance(result[key].l, queryCriteria.center);
+            if (distanceFromCenter <= queryCriteria.radius) {
+              data[key] = result[key];
+            }
+          }
+        });
+      }
     })).then(() => {
       return data;
     });
@@ -103,7 +117,17 @@ var GeoFire = function(firebaseRef) {
       update[key]["g"] = geohash;
       update[key]['l'] = location;
       if (doUpdate) {
-          return _firebaseRef.update(update);
+          // Check if the reference is realtime database or firestore
+          if(_firebaseRef.firestore) {
+            // Reduce the update object to just the properties to change
+            let trimmedUpdate = JSON.parse(JSON.stringify(update[key]));
+            // Delete out .priority
+            delete trimmedUpdate['.priority'];
+            // Run the Firestore update
+            return _firebaseRef.doc(key).update(trimmedUpdate);
+          } else {
+            return _firebaseRef.update(update);
+          }
       }
   };
   
@@ -118,13 +142,27 @@ var GeoFire = function(firebaseRef) {
       update[key + "/g"] = geohash;
       update[key + '/l'] = location;
       if (doUpdate) {
+        // Check if the reference is realtime database or firestore
+        if(_firebaseRef.firestore) {
+          // Reduce the update object to just the properties to change
+          let trimmedUpdate = {};
+          update(key, location, null, precision, trimmedUpdate);
+          trimmedUpdate = JSON.parse(JSON.stringify(trimmedUpdate[key]));
+          // Delete out .priority
+          delete trimmedUpdate['.priority'];
+          // Run the Firestore update
+          return _firebaseRef.doc(key).update(trimmedUpdate);
+        } else {
           return _firebaseRef.update(update);
+        }
       }
   };
   
-  this.commit = function(update) {
-      return _firebaseRef.update(update);
-  }
+  // This will be difficult to convert both types of update objects for either
+  // Firebase or Firestore. This doesn't seem used, so I am just taking it out...
+  // this.commit = function(update) {
+  //     return _firebaseRef.update(update);
+  // }
     
   /**
    * Adds the provided key - location pair(s) to Firebase. Returns an empty promise which is fulfilled when the write is complete.
@@ -167,8 +205,25 @@ var GeoFire = function(firebaseRef) {
         newData[key] = encodeGeoFireObject(location, geohash);
       }
     });
-
-    return _firebaseRef.update(newData);
+    
+    if(_firebaseRef.firestore) {
+      let updatePromises = [];
+      for(let key in newData) {
+        // Reduce the update object to just the properties to change
+        let trimmedUpdate = JSON.parse(JSON.stringify(newData[key]));
+        if(trimmedUpdate == null) {
+          updatePromises.push(_firebaseRef.doc(key).delete());
+        } else {
+          // Delete out .priority
+          delete trimmedUpdate['.priority'];
+          // Run the Firestore update
+          updatePromises.push(_firebaseRef.doc(key).update(trimmedUpdate));
+        }
+      }
+      return Promise.all(updatePromises);
+    } else {
+      return _firebaseRef.update(newData);
+    }
   };
 
   /**
@@ -181,14 +236,24 @@ var GeoFire = function(firebaseRef) {
    */
   this.get = function(key) {
     validateKey(key);
-    return _firebaseRef.child(key).once("value").then(function(dataSnapshot) {
-      var snapshotVal = dataSnapshot.val();
-      if (snapshotVal === null) {
-        return null;
-      } else {
-        return decodeGeoFireObject(snapshotVal);
-      }
-    });
+    if(_firebaseRef.firestore) {
+      return _firebaseRef.doc(key).get().then(docSnapshot => {
+        if(docSnapshot.exists) {
+          return decodeGeoFireObject(docSnapshot.data());
+        } else {
+          return null;
+        }
+      });
+    } else {
+      return _firebaseRef.child(key).once("value").then(function(dataSnapshot) {
+        var snapshotVal = dataSnapshot.val();
+        if (snapshotVal === null) {
+          return null;
+        } else {
+          return decodeGeoFireObject(snapshotVal);
+        }
+      });
+    }
   };
 
   /**
@@ -703,12 +768,14 @@ function decodeGeoFireObject(geoFireObj) {
 /**
  * Returns the key of a Firebase snapshot across SDK versions.
  *
- * @param {DataSnapshot} snapshot A Firebase snapshot.
+ * @param {Firebase DataSnapshot or Firestore QueryDocumentSnapshot} snapshot A Firebase snapshot.
  * @return {string|null} key The Firebase snapshot's key.
  */
  function getKey(snapshot) {
    var key;
-   if (typeof snapshot.key === "function") {
+   if (typeof snapshot.id === 'string') {
+     return snapshot.id;
+   } else if (typeof snapshot.key === "function") {
      key = snapshot.key();
    } else if (typeof snapshot.key === "string" || snapshot.key === null) {
      key = snapshot.key;
@@ -716,6 +783,22 @@ function decodeGeoFireObject(geoFireObj) {
      key = snapshot.name();
    }
    return key;
+ }
+ 
+ /**
+ * Returns the data of a Firebase snapshot across SDK versions.
+ *
+ * @param {Firebase DataSnapshot or Firestore QueryDocumentSnapshot} snapshot A Firebase snapshot.
+ * @return {Any} The Firebase snapshot's data.
+ */
+ function getData(snapshot) {
+   var data;
+   if (typeof snapshot.val === "function") {
+     data = snapshot.val();
+   } else if (typeof snapshot.data === "function") {
+     data = snapshot.data();
+   }
+   return data;
  }
 
 /**
@@ -792,11 +875,17 @@ var GeoQuery = function (firebaseRef, queryCriteria) {
    * @param {Object} queryState An object storing the current state of the query.
    */
   function _cancelGeohashQuery(query, queryState) {
-    var queryRef = _firebaseRef.orderByChild("g").startAt(query[0]).endAt(query[1]);
-    queryRef.off("child_added", queryState.childAddedCallback);
-    queryRef.off("child_removed", queryState.childRemovedCallback);
-    queryRef.off("child_changed", queryState.childChangedCallback);
-    queryRef.off("value", queryState.valueCallback);
+    // Check if the reference is realtime database or firestore
+    if(_firebaseRef.firestore) {
+      // All of the callbacks are unsubscribe functions, so just call any one
+      queryState.valueCallback();
+    } else {
+      var queryRef = _firebaseRef.orderByChild("g").startAt(query[0]).endAt(query[1]);
+      queryRef.off("child_added", queryState.childAddedCallback);
+      queryRef.off("child_removed", queryState.childRemovedCallback);
+      queryRef.off("child_changed", queryState.childChangedCallback);
+      queryRef.off("value", queryState.valueCallback);
+    }
   }
 
   /**
@@ -921,19 +1010,19 @@ var GeoQuery = function (firebaseRef, queryCriteria) {
   /**
    * Callback for child added events.
    *
-   * @param {Firebase DataSnapshot} locationDataSnapshot A snapshot of the data stored for this location.
+   * @param {Firebase DataSnapshot or Firestore QueryDocumentSnapshot} locationDataSnapshot A snapshot of the data stored for this location.
    */
   function _childAddedCallback(locationDataSnapshot) {
-    _updateLocation(getKey(locationDataSnapshot), locationDataSnapshot.val());
+    _updateLocation(getKey(locationDataSnapshot), getData(locationDataSnapshot));
   }
 
   /**
    * Callback for child changed events
    *
-   * @param {Firebase DataSnapshot} locationDataSnapshot A snapshot of the data stored for this location.
+   * @param {Firebase DataSnapshot or Firestore DocumentChange} locationDataSnapshot A snapshot of the data stored for this location.
    */
   function _childChangedCallback(locationDataSnapshot) {
-    _updateLocation(getKey(locationDataSnapshot), locationDataSnapshot.val());
+    _updateLocation(getKey(locationDataSnapshot), getData(locationDataSnapshot));
   }
 
   /**
@@ -960,20 +1049,33 @@ var GeoQuery = function (firebaseRef, queryCriteria) {
   function _childRemovedCallback(locationDataSnapshot) {
     var key = getKey(locationDataSnapshot);
     if (_locationsTracked.hasOwnProperty(key)) {
-      // _firebaseRef.child(key).once("value", function(snapshot) {
-      _firebaseRef.once("value", function(snapshot) {
-        let data = snapshot.val();
-        let child = data !== null && data[key] != null ? data[key] : null;
-        // var location = snapshot.val() === null ? null : decodeGeoFireObject(snapshot.val());
-        var location = child === null ? null : decodeGeoFireObject(child);
-        var geohash = (location !== null) ? encodeGeohash(location) : null;
-        // Only notify observers if key is not part of any other geohash query or this actually might not be
-        // a key exited event, but a key moved or entered event. These events will be triggered by updates
-        // to a different query
-        if (!_geohashInSomeQuery(geohash)) {
-          _removeLocation(key, location);
-        }
-      });
+      if(_firebaseRef.firestore) {
+        _firebaseRef.doc(key).get().then(docSnapshot => {
+          var location = docSnapshot.data() == null ? null : decodeGeoFireObject(docSnapshot.data());
+          var geohash = (location !== null) ? encodeGeohash(location) : null;
+          // Only notify observers if key is not part of any other geohash query or this actually might not be
+          // a key exited event, but a key moved or entered event. These events will be triggered by updates
+          // to a different query
+          if (!_geohashInSomeQuery(geohash)) {
+            _removeLocation(key, location);
+          }
+        });
+      } else {
+        // _firebaseRef.child(key).once("value", function(snapshot) {
+        _firebaseRef.once("value", function(snapshot) {
+          let data = snapshot.val();
+          let child = data !== null && data[key] != null ? data[key] : null;
+          // var location = snapshot.val() === null ? null : decodeGeoFireObject(snapshot.val());
+          var location = child === null ? null : decodeGeoFireObject(child);
+          var geohash = (location !== null) ? encodeGeohash(location) : null;
+          // Only notify observers if key is not part of any other geohash query or this actually might not be
+          // a key exited event, but a key moved or entered event. These events will be triggered by updates
+          // to a different query
+          if (!_geohashInSomeQuery(geohash)) {
+            _removeLocation(key, location);
+          }
+        });
+      }
     }
   }  
 
@@ -1039,31 +1141,66 @@ var GeoQuery = function (firebaseRef, queryCriteria) {
     // Once every geohash to query is processed, fire the "ready" event.
     geohashesToQuery.forEach(function(toQueryStr) {
       // decode the geohash query string
-      var query = _stringToQuery(toQueryStr);
-
-      // Create the Firebase query
-      var firebaseQuery = _firebaseRef.orderByChild("g").startAt(query[0]).endAt(query[1]);
-
-      // For every new matching geohash, determine if we should fire the "key_entered" event
-      var childAddedCallback = firebaseQuery.on("child_added", _childAddedCallback);
-      var childRemovedCallback = firebaseQuery.on("child_removed", _childRemovedCallback);
-      var childChangedCallback = firebaseQuery.on("child_changed", _childChangedCallback);
-      // Once the current geohash to query is processed, see if it is the last one to be processed
-      // and, if so, mark the value event as fired.
-      // Note that Firebase fires the "value" event after every "child_added" event fires.
-      var valueCallback = firebaseQuery.on("value", function() {
-        firebaseQuery.off("value", valueCallback);
-        _geohashQueryReadyCallback(toQueryStr);
-      });
-
-      // Add the geohash query to the current geohashes queried dictionary and save its state
-      _currentGeohashesQueried[toQueryStr] = {
-        active: true,
-        childAddedCallback: childAddedCallback,
-        childRemovedCallback: childRemovedCallback,
-        childChangedCallback: childChangedCallback,
-        valueCallback: valueCallback
-      };
+      let query = _stringToQuery(toQueryStr);
+      
+      // Check if the reference is realtime database or firestore
+      if(_firebaseRef.firestore) {
+        let queryReady = false;
+        // Create the Firestore query
+        let firebaseQuery = _firebaseRef.orderBy("g").startAt(query[0]).endAt(query[1]);
+        
+        let unsubscribeQuery = firebaseQuery.onSnapshot((snapshot) => {
+          snapshot.docChanges().forEach((change) => {
+            if (change.type === "added") {
+              _childAddedCallback(change.doc);
+            }
+            if (change.type === "modified") {
+              _childChangedCallback(change.doc);
+            }
+            if (change.type === "removed") {
+              _childRemovedCallback(change.doc);
+            }
+          });
+          // Call the query ready callback
+          if(!queryReady) {
+            queryReady = true;
+            _geohashQueryReadyCallback(toQueryStr);
+          }
+        });
+  
+        // Add the geohash query to the current geohashes queried dictionary and save its state
+        _currentGeohashesQueried[toQueryStr] = {
+          active: true,
+          childAddedCallback: unsubscribeQuery,
+          childRemovedCallback: unsubscribeQuery,
+          childChangedCallback: unsubscribeQuery,
+          valueCallback: unsubscribeQuery
+        };
+      } else {
+        // Create the Firebase query
+        var firebaseQuery = _firebaseRef.orderByChild("g").startAt(query[0]).endAt(query[1]);
+  
+        // For every new matching geohash, determine if we should fire the "key_entered" event
+        var childAddedCallback = firebaseQuery.on("child_added", _childAddedCallback);
+        var childRemovedCallback = firebaseQuery.on("child_removed", _childRemovedCallback);
+        var childChangedCallback = firebaseQuery.on("child_changed", _childChangedCallback);
+        // Once the current geohash to query is processed, see if it is the last one to be processed
+        // and, if so, mark the value event as fired.
+        // Note that Firebase fires the "value" event after every "child_added" event fires.
+        var valueCallback = firebaseQuery.on("value", function() {
+          firebaseQuery.off("value", valueCallback);
+          _geohashQueryReadyCallback(toQueryStr);
+        });
+  
+        // Add the geohash query to the current geohashes queried dictionary and save its state
+        _currentGeohashesQueried[toQueryStr] = {
+          active: true,
+          childAddedCallback: childAddedCallback,
+          childRemovedCallback: childRemovedCallback,
+          childChangedCallback: childChangedCallback,
+          valueCallback: valueCallback
+        };
+      }
     });
     // Based upon the algorithm to calculate geohashes, it's possible that no "new"
     // geohashes were queried even if the client updates the radius of the query.
